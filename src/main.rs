@@ -8,7 +8,9 @@ mod stdout_guard;
 
 use std::{
     collections::HashSet,
-    io::{self, Stdout},
+    fs::File,
+    io,
+    os::fd::FromRawFd,
     path::PathBuf,
     sync::mpsc::{self, Receiver},
     thread,
@@ -49,7 +51,7 @@ type ConnectionResult = std::result::Result<DeviceSnapshot, ZuneNotFound>;
 
 #[derive(Clone, Copy)]
 enum Screen {
-    Splash { continue_pressed: bool },
+    Splash,
     Files,
     Playlists,
     AddToPlaylist,
@@ -78,6 +80,13 @@ enum DeviceItemId {
 struct DeleteItem {
     object_id: u32,
     name: String,
+    /// True when this item is an actual device folder (album or artist
+    /// folder). The Zune tends to leave non-track files (e.g. its own
+    /// album-art thumbnails) inside album folders that never show up as a
+    /// `Track`, and deleting a folder that still contains one of those fails
+    /// at the device with a generic PTP error — so folder deletions first
+    /// sweep and remove any such stray files.
+    is_folder: bool,
 }
 
 struct DeleteConfirmation {
@@ -86,6 +95,15 @@ struct DeleteConfirmation {
     track_count: usize,
     album_count: usize,
     artist_names: Vec<String>,
+}
+
+/// Raised when uploading marked local files directly under an artist folder
+/// whose name doesn't match the files' detected artist. The user gets the
+/// final say — this only warns, it never blocks the placement.
+struct UploadMismatchConfirmation {
+    detected_artist: String,
+    target_artist: String,
+    job: TransferJob,
 }
 
 enum PlaylistConfirmation {
@@ -167,6 +185,7 @@ struct App {
     focused_pane: Pane,
     local_marks: HashSet<PathBuf>,
     device_marks: HashSet<u32>,
+    device_folder_marks: HashSet<u32>,
     local_anchor: Option<PathBuf>,
     device_anchor: Option<DeviceItemId>,
     transfer_receiver: Option<Receiver<TransferEvent>>,
@@ -175,7 +194,9 @@ struct App {
     download_directory: Option<PathBuf>,
     debug_open: bool,
     debug_scroll: usize,
+    splash_spinner_frame: usize,
     delete_confirmation: Option<DeleteConfirmation>,
+    upload_mismatch: Option<UploadMismatchConfirmation>,
     playlist_state: ListState,
     playlist_track_state: ListState,
     playlist_focus: PlaylistPane,
@@ -199,13 +220,12 @@ impl App {
         let local_tree = LocalTree::home()?;
         let mut local_state = TreeState::default();
         let root = local_tree.root_path();
+        local_state.open(vec![local_tree.mounts_root_path()]);
         local_state.select(vec![root.clone()]);
         local_state.open(vec![root]);
 
         Ok(Self {
-            screen: Screen::Splash {
-                continue_pressed: false,
-            },
+            screen: Screen::Splash,
             connection: Connection::Loading("Connecting..."),
             receiver: None,
             local_tree,
@@ -214,6 +234,7 @@ impl App {
             focused_pane: Pane::Local,
             local_marks: HashSet::new(),
             device_marks: HashSet::new(),
+            device_folder_marks: HashSet::new(),
             local_anchor: None,
             device_anchor: None,
             transfer_receiver: None,
@@ -222,7 +243,9 @@ impl App {
             download_directory: None,
             debug_open: false,
             debug_scroll: 0,
+            splash_spinner_frame: 0,
             delete_confirmation: None,
+            upload_mismatch: None,
             playlist_state: ListState::default().with_selected(Some(0)),
             playlist_track_state: ListState::default(),
             playlist_focus: PlaylistPane::Playlists,
@@ -259,14 +282,6 @@ impl App {
                 }
                 Err(_) => Connection::NotFound,
             };
-            if matches!(
-                self.screen,
-                Screen::Splash {
-                    continue_pressed: true
-                }
-            ) {
-                self.screen = Screen::Playlists;
-            }
             true
         } else {
             false
@@ -290,16 +305,17 @@ impl App {
     fn clear_marks(&mut self) {
         self.local_marks.clear();
         self.device_marks.clear();
+        self.device_folder_marks.clear();
         self.local_anchor = None;
         self.device_anchor = None;
     }
 
+    /// Any key on the splash screen advances past it — but only once the
+    /// connection attempt has actually finished; while still loading, the
+    /// splash shows a spinner instead of a prompt, so there's nothing to
+    /// "continue" past yet.
     fn continue_from_splash(&mut self) {
-        if matches!(self.connection, Connection::Loading(_)) {
-            self.screen = Screen::Splash {
-                continue_pressed: true,
-            };
-        } else {
+        if !matches!(self.connection, Connection::Loading(_)) {
             self.screen = Screen::Playlists;
         }
     }
@@ -337,11 +353,10 @@ impl App {
             self.request_delete();
             return;
         }
-        let focused_has_marks = match self.focused_pane {
-            Pane::Local => !self.local_marks.is_empty(),
-            Pane::Device => !self.device_marks.is_empty(),
-        };
-        if code == KeyCode::Enter && focused_has_marks {
+        let any_marks = !self.local_marks.is_empty()
+            || !self.device_marks.is_empty()
+            || !self.device_folder_marks.is_empty();
+        if code == KeyCode::Enter && any_marks {
             self.start_transfer();
             return;
         }
@@ -770,7 +785,7 @@ impl App {
                     }
                 } else {
                     self.transfer_status = Some(
-                        "Only files and Letter/Artist/Album folders can be marked.".to_owned(),
+                        "Only files and folders containing audio tracks can be marked.".to_owned(),
                     );
                     return;
                 }
@@ -787,16 +802,29 @@ impl App {
                         }
                     }
                     DeviceItemId::Folder(id) => {
-                        let Some(album) = self
+                        let Some(kind) = self
                             .connected_snapshot()
-                            .and_then(|snapshot| physical_album(snapshot, id))
+                            .map(|snapshot| device_folder_kind(snapshot, id))
                         else {
-                            self.transfer_status =
-                                Some("Only device albums and tracks can be marked.".to_owned());
                             return;
                         };
-                        let album = album.clone();
-                        toggle_track_group(&mut self.device_marks, &album.track_ids);
+                        match kind {
+                            DeviceFolderKind::Album(album) => {
+                                toggle_track_group(&mut self.device_marks, &album.track_ids);
+                            }
+                            DeviceFolderKind::EmptyAlbum => {
+                                if !self.device_folder_marks.remove(&id) {
+                                    self.device_folder_marks.insert(id);
+                                }
+                            }
+                            DeviceFolderKind::Other => {
+                                self.transfer_status = Some(
+                                    "Only device albums, tracks, and empty albums can be marked."
+                                        .to_owned(),
+                                );
+                                return;
+                            }
+                        }
                     }
                 }
                 self.device_anchor = Some(item);
@@ -839,6 +867,7 @@ impl App {
                     &snapshot.tracks,
                     &snapshot.albums,
                     &self.device_marks,
+                    &self.device_folder_marks,
                 );
                 let visible: Vec<_> = self
                     .device_state
@@ -867,7 +896,7 @@ impl App {
 
     fn request_delete(&mut self) {
         if self.focused_pane != Pane::Device
-            || self.device_marks.is_empty()
+            || (self.device_marks.is_empty() && self.device_folder_marks.is_empty())
             || self.transfer_receiver.is_some()
         {
             return;
@@ -875,7 +904,17 @@ impl App {
         let Some(snapshot) = self.connected_snapshot() else {
             return;
         };
-        let scope = delete_scope(snapshot, &self.device_marks);
+        let mut scope = delete_scope(snapshot, &self.device_marks);
+        for &folder_id in &self.device_folder_marks {
+            if let Some(folder) = find_folder(&snapshot.folders, folder_id) {
+                scope.items.push(DeleteItem {
+                    object_id: folder_id,
+                    name: format!("empty album {}", folder.name),
+                    is_folder: true,
+                });
+                scope.album_count += 1;
+            }
+        }
         if scope.items.is_empty() {
             return;
         }
@@ -917,12 +956,45 @@ impl App {
         }
     }
 
+    fn handle_upload_mismatch_confirmation(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let Some(confirmation) = self.upload_mismatch.take() else {
+                    return;
+                };
+                self.pending_transfer = Some(confirmation.job);
+                self.transfer_status = Some("Starting transfer...".to_owned());
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.upload_mismatch = None;
+                self.transfer_status = Some("Upload cancelled.".to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    /// Which direction a transfer should go: wherever the marks actually
+    /// are, not wherever the keyboard focus happens to be — the user may
+    /// have marked an album on one side, then tabbed over to the other pane
+    /// just to pick a destination folder. Only falls back to `focused_pane`
+    /// when that's ambiguous (marks on both sides, or neither).
+    fn transfer_direction(&self) -> Pane {
+        let local_has_marks = !self.local_marks.is_empty();
+        let device_has_marks =
+            !self.device_marks.is_empty() || !self.device_folder_marks.is_empty();
+        match (local_has_marks, device_has_marks) {
+            (true, false) => Pane::Local,
+            (false, true) => Pane::Device,
+            _ => self.focused_pane,
+        }
+    }
+
     fn start_transfer(&mut self) {
         if self.transfer_receiver.is_some() {
             self.transfer_status = Some("A transfer is already in progress.".to_owned());
             return;
         }
-        let job = match self.focused_pane {
+        let job = match self.transfer_direction() {
             Pane::Local => {
                 let Some(DeviceItemId::Folder(folder_id)) =
                     self.device_state.selected().last().copied()
@@ -940,8 +1012,23 @@ impl App {
                         Some("The selected Zune folder is unavailable.".to_owned());
                     return;
                 };
+                let files: Vec<_> = self.local_marks.iter().cloned().collect();
+                if let Some((detected, target)) =
+                    detect_upload_mismatch(snapshot, folder_id, &files)
+                {
+                    self.upload_mismatch = Some(UploadMismatchConfirmation {
+                        detected_artist: detected,
+                        target_artist: target,
+                        job: TransferJob::Upload {
+                            files: files.clone(),
+                            folder_id,
+                            storage_id: folder.storage_id,
+                        },
+                    });
+                    return;
+                }
                 TransferJob::Upload {
-                    files: self.local_marks.iter().cloned().collect(),
+                    files,
                     folder_id,
                     storage_id: folder.storage_id,
                 }
@@ -1135,7 +1222,7 @@ fn spawn_transfer(job: TransferJob) -> Receiver<TransferEvent> {
                         name: item.name.clone(),
                         verb: "Deleting",
                     });
-                    match device.delete_object(item.object_id, &item.name) {
+                    match device.delete_object(item.object_id, item.is_folder, &item.name) {
                         Ok(()) => completed += 1,
                         Err(error) => failures.push(format!("{}: {error}", item.name)),
                     }
@@ -1163,7 +1250,7 @@ fn spawn_transfer(job: TransferJob) -> Receiver<TransferEvent> {
                         name: playlist.name.clone(),
                         verb: "Deleting",
                     });
-                    match device.delete_object(playlist.id, &playlist.name) {
+                    match device.delete_object(playlist.id, false, &playlist.name) {
                         Ok(()) => completed += 1,
                         Err(error) => failures.push(format!("{}: {error}", playlist.name)),
                     }
@@ -1377,6 +1464,64 @@ fn physical_album(snapshot: &DeviceSnapshot, folder_id: u32) -> Option<PhysicalA
         .find(|album| album.folder_id == folder_id)
 }
 
+enum DeviceFolderKind {
+    Album(PhysicalAlbum),
+    EmptyAlbum,
+    Other,
+}
+
+/// Classifies a device folder for marking purposes. An "empty album" is an
+/// album-level folder (Music/Artist/Album) with no tracks and no
+/// subfolders — it can't be reached through `physical_album` because that
+/// only surfaces albums with at least one track.
+fn device_folder_kind(snapshot: &DeviceSnapshot, folder_id: u32) -> DeviceFolderKind {
+    if let Some(album) = physical_album(snapshot, folder_id) {
+        return DeviceFolderKind::Album(album);
+    }
+    for music in snapshot
+        .folders
+        .iter()
+        .filter(|folder| folder.name.eq_ignore_ascii_case("Music"))
+    {
+        for artist in &music.children {
+            for album in &artist.children {
+                if album.id == folder_id
+                    && album.children.is_empty()
+                    && !snapshot
+                        .tracks
+                        .iter()
+                        .any(|track| track.parent_id == album.id)
+                {
+                    return DeviceFolderKind::EmptyAlbum;
+                }
+            }
+        }
+    }
+    DeviceFolderKind::Other
+}
+
+/// When `folder_id` is an artist folder and at least one marked local file's
+/// detected artist doesn't match it, returns `(detected_artist,
+/// target_artist)` so the caller can ask the user to confirm. `None` means
+/// either there's nothing to warn about, or not enough information (no
+/// artist-level destination, or no readable artist) to say either way.
+fn detect_upload_mismatch(
+    snapshot: &DeviceSnapshot,
+    folder_id: u32,
+    files: &[PathBuf],
+) -> Option<(String, String)> {
+    if !mtp::is_artist_folder(&snapshot.folders, folder_id) {
+        return None;
+    }
+    let folder = find_folder(&snapshot.folders, folder_id)?;
+    let detected = files.iter().find_map(|path| mtp::detect_artist(path))?;
+    if mtp::same_artist_name(&detected, &folder.name) {
+        None
+    } else {
+        Some((detected, folder.name.clone()))
+    }
+}
+
 struct DeleteScope {
     items: Vec<DeleteItem>,
     track_count: usize,
@@ -1392,6 +1537,7 @@ fn delete_scope(snapshot: &DeviceSnapshot, marks: &HashSet<u32>) -> DeleteScope 
         .map(|album| DeleteItem {
             object_id: album.id,
             name: format!("album {}", album.name),
+            is_folder: false,
         })
         .collect();
     let selected_albums: Vec<_> = physical_albums(snapshot)
@@ -1406,11 +1552,13 @@ fn delete_scope(snapshot: &DeviceSnapshot, marks: &HashSet<u32>) -> DeleteScope 
             .map(|track| DeleteItem {
                 object_id: track.id,
                 name: track.name.clone(),
+                is_folder: false,
             }),
     );
     items.extend(selected_albums.iter().map(|album| DeleteItem {
         object_id: album.folder_id,
         name: format!("album folder {}", album.name),
+        is_folder: true,
     }));
 
     let mut artist_names = Vec::new();
@@ -1425,6 +1573,7 @@ fn delete_scope(snapshot: &DeviceSnapshot, marks: &HashSet<u32>) -> DeleteScope 
             items.push(DeleteItem {
                 object_id: album.artist_id,
                 name: format!("artist folder {}", album.artist_name),
+                is_folder: true,
             });
         }
     }
@@ -1445,9 +1594,16 @@ fn main() -> Result<()> {
     color_eyre::install()?;
     debug_log::init()?;
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    // Render through a private duplicate of the real terminal fd, taken
+    // before any libmtp call can redirect fd 1 to /dev/null via
+    // `stdout_guard::silenced` (held for the whole, sometimes multi-second,
+    // USB device-detection call). Drawing through `io::stdout()` directly
+    // would mean every frame drawn during a connection attempt — like the
+    // splash screen's spinner — silently vanishes into that redirect
+    // instead of reaching the terminal.
+    let mut real_stdout = duplicate_stdout()?;
+    execute!(real_stdout, EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(real_stdout))?;
     let result = run(&mut terminal);
     disable_raw_mode()?;
     stdout_guard::synchronized(|| -> Result<()> {
@@ -1458,7 +1614,21 @@ fn main() -> Result<()> {
     result
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+fn duplicate_stdout() -> Result<File> {
+    // SAFETY: STDOUT_FILENO (1) is a valid, open fd for the process for the
+    // entire program lifetime. `dup` returns a new fd referencing the same
+    // underlying terminal, independent of whatever fd 1 itself is later
+    // redirected to.
+    let fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    if fd == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: `fd` was just returned by `dup` above and is owned exclusively
+    // by this `File`, which closes it on drop.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn run(terminal: &mut Terminal<CrosstermBackend<File>>) -> Result<()> {
     let mut app = App::new()?;
     stdout_guard::synchronized(|| terminal.draw(|frame| draw(frame, &mut app)))?;
     app.start_connection("Connecting...");
@@ -1467,6 +1637,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     loop {
         needs_draw |= app.collect_connection_result();
         needs_draw |= app.collect_transfer_events();
+        if matches!(app.screen, Screen::Splash) && matches!(app.connection, Connection::Loading(_))
+        {
+            app.splash_spinner_frame = app.splash_spinner_frame.wrapping_add(1);
+            needs_draw = true;
+        }
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
@@ -1495,6 +1670,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                     }
                     if app.delete_confirmation.is_some() {
                         app.handle_delete_confirmation(key.code);
+                        needs_draw = true;
+                        continue;
+                    }
+                    if app.upload_mismatch.is_some() {
+                        app.handle_upload_mismatch_confirmation(key.code);
                         needs_draw = true;
                         continue;
                     }
@@ -1533,7 +1713,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
                         KeyCode::Char('3') => app.enter_add_to_playlist(),
                         KeyCode::Char('4') => app.enter_settings(),
                         _ => match app.screen {
-                            Screen::Splash { .. } => app.continue_from_splash(),
+                            Screen::Splash => app.continue_from_splash(),
                             Screen::Files => app.handle_file_key(key),
                             Screen::Playlists => app.handle_playlist_key(key),
                             Screen::AddToPlaylist => app.handle_add_to_playlist_key(key),
@@ -1547,11 +1727,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
             }
         }
 
-        if needs_draw
-            && let Some(result) =
-                stdout_guard::try_synchronized(|| terminal.draw(|frame| draw(frame, &mut app)))
-        {
-            result?;
+        if needs_draw {
+            // No `stdout_guard` lock here: this backend writes through a
+            // private duplicated fd (see `main`), never fd 1, so it can't
+            // collide with a concurrent `silenced()` call. Skipping the draw
+            // while one was in flight is what used to freeze the splash
+            // screen's spinner for the whole, sometimes multi-second,
+            // connection attempt.
+            terminal.draw(|frame| draw(frame, &mut app))?;
             needs_draw = false;
             if let Some(job) = app.pending_transfer.take() {
                 app.transfer_receiver = Some(spawn_transfer(job));
@@ -1570,7 +1753,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
         frame.area(),
     );
     match app.screen {
-        Screen::Splash { continue_pressed } => draw_splash(frame, continue_pressed),
+        Screen::Splash => {
+            draw_splash(frame, &app.connection, app.splash_spinner_frame);
+        }
         Screen::Files => draw_files(frame, app),
         Screen::Playlists => draw_playlists(frame, app),
         Screen::AddToPlaylist => draw_add_to_playlist(frame, app),
@@ -1578,6 +1763,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some(confirmation) = &app.delete_confirmation {
         draw_delete_confirmation(frame, confirmation);
+    }
+    if let Some(confirmation) = &app.upload_mismatch {
+        draw_upload_mismatch_confirmation(frame, confirmation);
     }
     if let Some(confirmation) = &app.playlist_confirmation {
         draw_playlist_confirmation(frame, confirmation);
@@ -1612,6 +1800,33 @@ fn draw_delete_confirmation(frame: &mut Frame, confirmation: &DeleteConfirmation
             .block(themed_block(" CONFIRM DELETE ", true)),
         area,
     );
+}
+
+fn draw_upload_mismatch_confirmation(frame: &mut Frame, confirmation: &UploadMismatchConfirmation) {
+    let message = upload_mismatch_message(confirmation);
+    let width = frame.area().width.saturating_sub(8).clamp(20, 72);
+    let area = centered(frame.area(), width, 5);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(message)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false })
+            .style(
+                Style::default()
+                    .fg(palette().error)
+                    .bg(palette().background)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(themed_block(" CONFIRM ARTIST ", true)),
+        area,
+    );
+}
+
+fn upload_mismatch_message(confirmation: &UploadMismatchConfirmation) -> String {
+    format!(
+        "These files look like they're by '{}', but you're placing them under '{}' on the Zune. Continue anyway? [y/N]",
+        confirmation.detected_artist, confirmation.target_artist
+    )
 }
 
 fn delete_confirmation_message(confirmation: &DeleteConfirmation) -> String {
@@ -1695,31 +1910,64 @@ fn wrap_debug_lines(lines: Vec<String>, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn draw_splash(frame: &mut Frame, continue_pressed: bool) {
-    let area = centered(frame.area(), 78, 14);
-    frame.render_widget(Clear, area);
-    let prompt = if continue_pressed {
-        "Connecting to Zune..."
+/// A little bouncing ball, ping-ponging between the walls of a fixed-width
+/// track — shown in place of "press any key to continue" while still
+/// waiting on the Zune connection attempt.
+const SPINNER_WIDTH: usize = 10;
+
+fn spinner_line(frame: usize) -> String {
+    let period = 2 * (SPINNER_WIDTH - 1);
+    // Divide down so the ball advances every few redraws instead of every
+    // single one — the redraw loop ticks at 50ms, which would otherwise
+    // make the bounce look frantic rather than cute.
+    let phase = (frame / 3) % period;
+    let position = if phase < SPINNER_WIDTH {
+        phase
     } else {
-        "press any key to continue"
+        period - phase
     };
+    let mut line = String::with_capacity(SPINNER_WIDTH + 2);
+    line.push('[');
+    for slot in 0..SPINNER_WIDTH {
+        line.push(if slot == position { '●' } else { ' ' });
+    }
+    line.push(']');
+    line
+}
+
+fn draw_splash(frame: &mut Frame, connection: &Connection, spinner_frame: usize) {
+    let area = centered(frame.area(), 78, 16);
+    frame.render_widget(Clear, area);
     let logo_style = Style::default()
         .fg(palette().primary)
         .add_modifier(Modifier::BOLD);
-    let mut lines: Vec<Line<'_>> = LOGO
-        .lines()
-        .map(|line| Line::styled(line, logo_style))
-        .collect();
+    let mut lines: Vec<Line<'_>> = vec![Line::from("")];
+    lines.extend(LOGO.lines().map(|line| Line::styled(line, logo_style)));
     lines.extend([
         Line::from(""),
         Line::styled("columbia foundry llc", Style::default().fg(palette().muted)),
         Line::from(""),
-        Line::styled(prompt, Style::default().fg(palette().accent)),
     ]);
+    match connection {
+        Connection::Loading(message) => lines.extend([
+            Line::styled(*message, Style::default().fg(palette().accent)),
+            Line::styled(
+                spinner_line(spinner_frame),
+                Style::default().fg(palette().primary),
+            ),
+        ]),
+        Connection::Connected(_) | Connection::NotFound => lines.extend([
+            Line::styled(
+                "press any key to continue",
+                Style::default().fg(palette().accent),
+            ),
+            Line::from(""),
+        ]),
+    }
     frame.render_widget(
         Paragraph::new(Text::from(lines))
             .alignment(Alignment::Center)
-            .block(themed_block(" ZUNE TUI ", true)),
+            .block(themed_block("", true)),
         area,
     );
 }
@@ -1733,7 +1981,7 @@ fn draw_files(frame: &mut Frame, app: &mut App) {
     let local_items = app.local_tree.items(&app.local_marks);
     let local_widget = tree_widget(
         &local_items,
-        " LOCAL — $HOME ",
+        " LOCAL — HOME & MOUNTED DRIVES ",
         app.focused_pane == Pane::Local,
     );
     frame.render_stateful_widget(local_widget, local_area, &mut app.local_state);
@@ -1745,6 +1993,7 @@ fn draw_files(frame: &mut Frame, app: &mut App) {
                 &snapshot.tracks,
                 &snapshot.albums,
                 &app.device_marks,
+                &app.device_folder_marks,
             );
             let device_widget = tree_widget(
                 &device_items,
@@ -1928,6 +2177,7 @@ fn draw_add_to_playlist(frame: &mut Frame, app: &mut App) {
                 &snapshot.tracks,
                 &snapshot.albums,
                 &app.add_to_marks,
+                &HashSet::new(),
             );
             frame.render_stateful_widget(
                 tree_widget(
@@ -2023,11 +2273,18 @@ fn draw_help(frame: &mut Frame) {
         Line::styled("File Management", heading),
         row("Tab", "swap pane focus"),
         row("Arrows", "navigate folders and files"),
-        row("Space", "mark a file, track, or recognized album"),
+        row(
+            "Space",
+            "mark a file, track, recognized album, or empty album",
+        ),
         row("Shift+Space", "mark a visible range"),
         row(
             "Enter",
             "copy marked items to the other pane; otherwise open folder",
+        ),
+        row(
+            "",
+            "(uploading under a Zune artist folder warns on an artist mismatch)",
         ),
         row("c", "clear all marks"),
         row("Del", "delete marked device items with confirmation"),
@@ -2152,6 +2409,7 @@ fn folder_items(
     tracks: &[Track],
     _albums: &[Album],
     marked: &HashSet<u32>,
+    folder_marks: &HashSet<u32>,
 ) -> Vec<TreeItem<'static, DeviceItemId>> {
     let album_folder_ids: HashSet<_> = folders
         .iter()
@@ -2163,7 +2421,7 @@ fn folder_items(
     folders
         .iter()
         .filter(|folder| !is_album_object_folder(folder))
-        .map(|folder| folder_item(folder, tracks, marked, &album_folder_ids))
+        .map(|folder| folder_item(folder, tracks, marked, folder_marks, &album_folder_ids))
         .collect()
 }
 
@@ -2175,6 +2433,7 @@ fn folder_item(
     folder: &Folder,
     tracks: &[Track],
     marked: &HashSet<u32>,
+    folder_marks: &HashSet<u32>,
     album_folder_ids: &HashSet<u32>,
 ) -> TreeItem<'static, DeviceItemId> {
     let mut child_folders: Vec<_> = folder.children.iter().collect();
@@ -2183,7 +2442,7 @@ fn folder_item(
     }
     let mut children: Vec<_> = child_folders
         .into_iter()
-        .map(|child| folder_item(child, tracks, marked, album_folder_ids))
+        .map(|child| folder_item(child, tracks, marked, folder_marks, album_folder_ids))
         .collect();
     children.extend(
         tracks
@@ -2208,6 +2467,13 @@ fn folder_item(
         .collect();
     let label = if album_folder_ids.contains(&folder.id) && !direct_track_ids.is_empty() {
         let indicator = if group_is_fully_marked(&direct_track_ids, marked) {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        format!("{indicator} {}", folder.name)
+    } else if album_folder_ids.contains(&folder.id) && folder.children.is_empty() {
+        let indicator = if folder_marks.contains(&folder.id) {
             "[x]"
         } else {
             "[ ]"
@@ -2377,6 +2643,19 @@ mod tests {
     }
 
     #[test]
+    fn spinner_line_bounces_back_and_forth_within_its_track() {
+        assert_eq!(spinner_line(0), "[●         ]");
+        assert_eq!(spinner_line(3), "[ ●        ]");
+        // Full swing right (position SPINNER_WIDTH - 1), then bounces back.
+        let full_swing = 3 * (SPINNER_WIDTH - 1);
+        assert_eq!(spinner_line(full_swing), "[         ●]");
+        assert_eq!(spinner_line(full_swing + 3), "[        ● ]");
+        // A full period (there and back) returns to the start.
+        let period = 2 * (SPINNER_WIDTH - 1);
+        assert_eq!(spinner_line(3 * period), spinner_line(0));
+    }
+
+    #[test]
     fn fully_marked_only_album_cascades_through_artist_with_full_confirmation() {
         let snapshot = physical_delete_snapshot(false);
         let scope = delete_scope(&snapshot, &HashSet::from([20, 21]));
@@ -2523,6 +2802,109 @@ mod tests {
     }
 
     #[test]
+    fn detect_upload_mismatch_flags_a_different_artist_folder() {
+        let snapshot = physical_delete_snapshot(false);
+        let files = vec![PathBuf::from("/music/Z/ZZ Top/Deguello/track.mp3")];
+        assert_eq!(
+            detect_upload_mismatch(&snapshot, 11, &files),
+            Some(("ZZ Top".to_owned(), "Beatles".to_owned()))
+        );
+    }
+
+    #[test]
+    fn detect_upload_mismatch_is_none_when_artist_matches_or_destination_is_an_album() {
+        let snapshot = physical_delete_snapshot(false);
+        let matching = vec![PathBuf::from("/music/B/Beatles/Abbey Road/track.mp3")];
+        assert_eq!(detect_upload_mismatch(&snapshot, 11, &matching), None);
+
+        let mismatched = vec![PathBuf::from("/music/Z/ZZ Top/Deguello/track.mp3")];
+        assert_eq!(detect_upload_mismatch(&snapshot, 12, &mismatched), None);
+    }
+
+    #[test]
+    fn upload_mismatch_confirmation_gates_the_transfer_until_confirmed() {
+        let mut app = App::new().expect("local tree");
+        app.focused_pane = Pane::Local;
+        app.connection = Connection::Connected(physical_delete_snapshot(false));
+        app.local_marks
+            .insert(PathBuf::from("/music/Z/ZZ Top/Deguello/track.mp3"));
+        app.device_state
+            .select(vec![DeviceItemId::Folder(10), DeviceItemId::Folder(11)]);
+
+        app.start_transfer();
+        assert!(app.transfer_receiver.is_none());
+        let confirmation = app.upload_mismatch.as_ref().expect("mismatch confirmation");
+        assert_eq!(confirmation.detected_artist, "ZZ Top");
+        assert_eq!(confirmation.target_artist, "Beatles");
+
+        app.handle_upload_mismatch_confirmation(KeyCode::Esc);
+        assert!(app.upload_mismatch.is_none());
+        assert!(app.pending_transfer.is_none());
+    }
+
+    #[test]
+    fn confirming_the_upload_mismatch_queues_the_original_job() {
+        let mut app = App::new().expect("local tree");
+        app.focused_pane = Pane::Local;
+        app.connection = Connection::Connected(physical_delete_snapshot(false));
+        app.local_marks
+            .insert(PathBuf::from("/music/Z/ZZ Top/Deguello/track.mp3"));
+        app.device_state
+            .select(vec![DeviceItemId::Folder(10), DeviceItemId::Folder(11)]);
+
+        app.start_transfer();
+        app.handle_upload_mismatch_confirmation(KeyCode::Char('y'));
+        assert!(app.upload_mismatch.is_none());
+        let Some(TransferJob::Upload { folder_id, .. }) = app.pending_transfer else {
+            panic!("expected a queued upload job");
+        };
+        assert_eq!(folder_id, 11);
+    }
+
+    #[test]
+    fn transfer_direction_follows_marks_not_focus() {
+        let mut app = App::new().expect("local tree");
+        app.focused_pane = Pane::Device;
+        app.local_marks
+            .insert(PathBuf::from("/some/local/album/track.mp3"));
+        assert!(matches!(app.transfer_direction(), Pane::Local));
+
+        app.local_marks.clear();
+        app.device_marks.insert(20);
+        assert!(matches!(app.transfer_direction(), Pane::Device));
+    }
+
+    #[test]
+    fn enter_targets_a_device_folder_even_after_tabbing_away_from_the_marked_pane() {
+        let mut app = App::new().expect("local tree");
+        app.connection = Connection::Connected(physical_delete_snapshot(false));
+        app.local_marks
+            .insert(PathBuf::from("/music/Z/ZZ Top/Deguello/track.mp3"));
+        app.device_state
+            .select(vec![DeviceItemId::Folder(10), DeviceItemId::Folder(11)]);
+        // Mark an album on Local, then Tab over to browse the Zune for a
+        // destination — focus lands on Device, but the marks stayed put on
+        // Local. Enter must still resolve this as an upload targeting
+        // whatever the Device cursor is sitting on.
+        app.focused_pane = Pane::Device;
+
+        app.start_transfer();
+        assert!(
+            app.transfer_receiver.is_none(),
+            "should not have started a download using the (empty) device marks"
+        );
+        let confirmation = app
+            .upload_mismatch
+            .as_ref()
+            .expect("expected an upload, gated on the artist mismatch");
+        assert_eq!(confirmation.target_artist, "Beatles");
+        let TransferJob::Upload { folder_id, .. } = &confirmation.job else {
+            panic!("expected an Upload job even though the Device pane has focus");
+        };
+        assert_eq!(*folder_id, 11);
+    }
+
+    #[test]
     fn delete_is_ignored_for_local_focus_or_no_device_marks() {
         let mut app = App::new().expect("local tree");
         app.request_delete();
@@ -2534,6 +2916,63 @@ mod tests {
     }
 
     #[test]
+    fn empty_album_can_be_marked_and_unmarked_but_not_deleted_via_track_marks() {
+        let mut app = App::new().expect("local tree");
+        app.focused_pane = Pane::Device;
+        app.connection = Connection::Connected(physical_delete_snapshot(true));
+        app.device_state.select(vec![
+            DeviceItemId::Folder(10),
+            DeviceItemId::Folder(11),
+            DeviceItemId::Folder(13),
+        ]);
+
+        app.toggle_mark();
+        assert_eq!(app.device_folder_marks, HashSet::from([13]));
+        assert!(app.device_marks.is_empty());
+
+        app.toggle_mark();
+        assert!(app.device_folder_marks.is_empty());
+    }
+
+    #[test]
+    fn empty_album_mark_is_deletable_and_survives_clearing_after_transfer() {
+        let mut app = App::new().expect("local tree");
+        app.focused_pane = Pane::Device;
+        app.connection = Connection::Connected(physical_delete_snapshot(true));
+        app.device_folder_marks.insert(13);
+
+        app.request_delete();
+        let confirmation = app.delete_confirmation.as_ref().expect("confirmation");
+        assert_eq!(confirmation.album_count, 1);
+        assert!(
+            confirmation
+                .items
+                .iter()
+                .any(|item| item.object_id == 13 && item.name == "empty album Revolver")
+        );
+
+        app.handle_delete_confirmation(KeyCode::Char('y'));
+        assert!(app.pending_transfer.is_some());
+    }
+
+    #[test]
+    fn artist_folder_cannot_be_marked() {
+        let mut app = App::new().expect("local tree");
+        app.focused_pane = Pane::Device;
+        app.connection = Connection::Connected(physical_delete_snapshot(true));
+        app.device_state
+            .select(vec![DeviceItemId::Folder(10), DeviceItemId::Folder(11)]);
+
+        app.toggle_mark();
+        assert!(app.device_marks.is_empty());
+        assert!(app.device_folder_marks.is_empty());
+        assert_eq!(
+            app.transfer_status.as_deref(),
+            Some("Only device albums, tracks, and empty albums can be marked.")
+        );
+    }
+
+    #[test]
     fn delete_confirmation_queues_worker_after_setting_immediate_status() {
         let mut app = App::new().expect("local tree");
         app.delete_confirmation = Some(DeleteConfirmation {
@@ -2541,6 +2980,7 @@ mod tests {
             items: vec![DeleteItem {
                 object_id: 42,
                 name: "Song".to_owned(),
+                is_folder: false,
             }],
             track_count: 1,
             album_count: 0,
