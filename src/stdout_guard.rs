@@ -2,7 +2,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
     os::fd::{AsRawFd, RawFd},
-    sync::{Mutex, MutexGuard, TryLockError},
+    sync::{Mutex, MutexGuard},
 };
 
 static STDOUT_LOCK: Mutex<()> = Mutex::new(());
@@ -16,15 +16,6 @@ pub fn silenced<R>(operation: impl FnOnce() -> R) -> R {
     let _lock = lock_stdout();
     let _redirect = StdoutRedirect::new().ok();
     operation()
-}
-
-pub fn try_synchronized<R>(operation: impl FnOnce() -> R) -> Option<R> {
-    let _lock = match STDOUT_LOCK.try_lock() {
-        Ok(lock) => lock,
-        Err(TryLockError::Poisoned(error)) => error.into_inner(),
-        Err(TryLockError::WouldBlock) => return None,
-    };
-    Some(operation())
 }
 
 fn lock_stdout() -> MutexGuard<'static, ()> {

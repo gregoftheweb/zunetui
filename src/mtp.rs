@@ -324,7 +324,19 @@ impl Device {
         })
     }
 
-    pub fn delete_object(&self, object_id: u32, name: &str) -> Result<(), String> {
+    /// Deletes a device object. `is_folder` marks `object_id` as a folder:
+    /// the device won't delete a folder that still holds objects it never
+    /// told us about (the Zune stashes its own album-art thumbnails inside
+    /// album folders, invisible to `tracks()`), so its full contents are
+    /// wiped recursively first. The caller has already confirmed this
+    /// deletion, so everything inside goes with it.
+    pub fn delete_object(&self, object_id: u32, is_folder: bool, name: &str) -> Result<(), String> {
+        debug_log::log(format!(
+            "delete requested: object_id={object_id}, name={name:?}, is_folder={is_folder}"
+        ));
+        if is_folder {
+            self.wipe_folder_contents(object_id, name)?;
+        }
         debug_log::log(format!(
             "LIBMTP_Delete_Object(object_id={object_id}, name={name:?})"
         ));
@@ -335,12 +347,102 @@ impl Device {
                 ));
                 Ok(())
             } else {
+                let error = self.take_error_stack();
                 debug_log::log(format!(
-                    "LIBMTP_Delete_Object(object_id={object_id}, name={name:?}) -> failure"
+                    "LIBMTP_Delete_Object(object_id={object_id}, name={name:?}) -> failure: {error}"
                 ));
-                Err(self.take_error_stack())
+                Err(error)
             }
         })
+    }
+
+    /// Recursively deletes every object parented directly or indirectly
+    /// under `folder_id`, leaving the folder itself empty for the caller to
+    /// delete. `LIBMTP_Get_Files_And_Folders` can't be used here: libmtp
+    /// refuses it once the device's object cache is built (logged as "tried
+    /// to use LIBMTP_Get_Files_And_Folders on a cached device!"), which is
+    /// always true for us since `folders()`/`tracks()` build that cache at
+    /// connection time. Instead this re-fetches the folder tree (for
+    /// subfolder ids) and the full file listing (for anything parented
+    /// there that isn't a `Track` — e.g. the Zune's own album-art files),
+    /// both of which are cache-safe.
+    fn wipe_folder_contents(&self, folder_id: u32, name: &str) -> Result<(), String> {
+        let folders = self.folders();
+        let mut folder_ids = vec![folder_id];
+        let mut delete_subfolders_first = Vec::new();
+        if let Some(target) = find_folder_ref(&folders, folder_id) {
+            collect_descendant_ids_post_order(target, &mut delete_subfolders_first);
+            folder_ids.extend(delete_subfolders_first.iter().copied());
+        } else {
+            debug_log::log(format!(
+                "wipe_folder_contents: folder_id={folder_id} ({name:?}) not found in a fresh folder listing; clearing files by parent_id only"
+            ));
+        }
+        debug_log::log(format!(
+            "wipe_folder_contents: folder_id={folder_id} ({name:?}), subfolder_ids={delete_subfolders_first:?}"
+        ));
+
+        debug_log::log("LIBMTP_Get_Filelisting_With_Callback() to find files hidden from tracks()");
+        let files = stdout_guard::silenced(|| unsafe {
+            let head = raw::LIBMTP_Get_Filelisting_With_Callback(self.ptr, None, std::ptr::null());
+            let mut files = Vec::new();
+            let mut current = head;
+            while !current.is_null() {
+                let entry = &*current;
+                files.push((entry.item_id, entry.parent_id, entry.filetype));
+                current = entry.next;
+            }
+            if !head.is_null() {
+                raw::LIBMTP_destroy_file_t(head);
+            }
+            files
+        });
+        debug_log::log(format!(
+            "LIBMTP_Get_Filelisting_With_Callback() -> {} file(s) on device",
+            files.len()
+        ));
+
+        for (item_id, parent_id, filetype) in &files {
+            if *filetype == raw::LIBMTP_filetype_t_LIBMTP_FILETYPE_FOLDER
+                || !folder_ids.contains(parent_id)
+            {
+                continue;
+            }
+            debug_log::log(format!(
+                "clearing stray file before folder delete: item_id={item_id}, parent_id={parent_id}, filetype={filetype}"
+            ));
+            stdout_guard::silenced(|| unsafe {
+                if raw::LIBMTP_Delete_Object(self.ptr, *item_id) == 0 {
+                    Ok(())
+                } else {
+                    let error = self.take_error_stack();
+                    debug_log::log(format!(
+                        "LIBMTP_Delete_Object(object_id={item_id}) -> failure: {error}"
+                    ));
+                    Err(format!(
+                        "could not clear a stray file inside the folder before deleting it: {error}"
+                    ))
+                }
+            })?;
+        }
+
+        for subfolder_id in delete_subfolders_first {
+            debug_log::log(format!(
+                "LIBMTP_Delete_Object(object_id={subfolder_id}) — emptied subfolder of {folder_id}"
+            ));
+            stdout_guard::silenced(|| unsafe {
+                if raw::LIBMTP_Delete_Object(self.ptr, subfolder_id) == 0 {
+                    Ok(())
+                } else {
+                    let error = self.take_error_stack();
+                    debug_log::log(format!(
+                        "LIBMTP_Delete_Object(object_id={subfolder_id}) -> failure: {error}"
+                    ));
+                    Err(format!("could not delete an emptied subfolder: {error}"))
+                }
+            })?;
+        }
+        Ok(())
     }
 
     pub fn upload_track_resolved(
@@ -361,12 +463,14 @@ impl Device {
             .ok_or_else(|| "source has no filename".to_owned())?;
         let filename_c = os_cstring(filename)?;
         let parsed = UploadTrackMetadata::read(source, filename)?;
-        let (parent_id, storage_id) = match (parsed.artist.as_deref(), parsed.album.as_deref()) {
-            (Some(artist), Some(album)) => {
-                self.resolve_music_destination(folders, fallback_storage_id, artist, album)?
-            }
-            _ => (fallback_parent_id, fallback_storage_id),
-        };
+        let (parent_id, storage_id) = self.resolve_upload_destination(
+            folders,
+            source,
+            fallback_parent_id,
+            fallback_storage_id,
+            parsed.artist.as_deref(),
+            parsed.album.as_deref(),
+        )?;
         let title = parsed.title.as_deref().unwrap_or_default();
         if duplicate_track_exists(tracks, parent_id, title) {
             debug_log::log(format!(
@@ -457,6 +561,73 @@ impl Device {
                 }
             }
         })
+    }
+
+    /// Picks the upload destination. A folder the caller explicitly picked
+    /// on the device (an artist or album folder under Music) always wins
+    /// over tag-derived placement — that's how "put this album under that
+    /// artist" is honored even when the file's tags disagree. Otherwise
+    /// falls back to matching/creating a Music/Artist/Album path from tags,
+    /// or the caller's fallback folder when there are no usable tags.
+    fn resolve_upload_destination(
+        &self,
+        folders: &mut [Folder],
+        source: &Path,
+        fallback_parent_id: u32,
+        fallback_storage_id: u32,
+        artist: Option<&str>,
+        album: Option<&str>,
+    ) -> Result<(u32, u32), String> {
+        match explicit_destination(folders, fallback_parent_id) {
+            ExplicitDestination::Album {
+                folder_id,
+                storage_id,
+            } => Ok((folder_id, storage_id)),
+            ExplicitDestination::Artist {
+                artist_folder_id,
+                storage_id,
+            } => {
+                let album_name = album
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| local_album_folder_name(source));
+                let id = self.find_or_create_album_under_artist(
+                    folders,
+                    artist_folder_id,
+                    storage_id,
+                    &album_name,
+                )?;
+                Ok((id, storage_id))
+            }
+            ExplicitDestination::None => match (artist, album) {
+                (Some(artist), Some(album)) => {
+                    self.resolve_music_destination(folders, fallback_storage_id, artist, album)
+                }
+                _ => Ok((fallback_parent_id, fallback_storage_id)),
+            },
+        }
+    }
+
+    fn find_or_create_album_under_artist(
+        &self,
+        folders: &mut [Folder],
+        artist_folder_id: u32,
+        storage_id: u32,
+        album_name: &str,
+    ) -> Result<u32, String> {
+        let artist_folder = find_folder_mut(folders, artist_folder_id)
+            .ok_or_else(|| "selected artist folder is no longer available".to_owned())?;
+        if let Some(index) = matching_folder_index(&artist_folder.children, album_name) {
+            return Ok(artist_folder.children[index].id);
+        }
+        let name = name_without_leading_the(album_name);
+        let id = self.create_folder(name, artist_folder.id, storage_id)?;
+        artist_folder.children.push(Folder {
+            id,
+            storage_id,
+            name: name.to_owned(),
+            children: Vec::new(),
+        });
+        Ok(id)
     }
 
     fn resolve_music_destination(
@@ -694,6 +865,134 @@ impl Device {
             ))
         }
     }
+}
+
+enum ExplicitDestination {
+    /// The caller picked an album-level folder (Music/Artist/Album) directly:
+    /// use it as-is, no tag matching at all.
+    Album { folder_id: u32, storage_id: u32 },
+    /// The caller picked an artist-level folder (Music/Artist): file the
+    /// upload under it, resolving only the album name.
+    Artist {
+        artist_folder_id: u32,
+        storage_id: u32,
+    },
+    /// The caller's folder isn't an artist/album folder under Music (e.g.
+    /// Music itself, or an unrelated folder) — defer to tag-based placement.
+    None,
+}
+
+fn explicit_destination(folders: &[Folder], folder_id: u32) -> ExplicitDestination {
+    let Some(path) = folder_path(folders, folder_id) else {
+        return ExplicitDestination::None;
+    };
+    let Some(music_index) = path
+        .iter()
+        .position(|folder| folder.name.eq_ignore_ascii_case("Music"))
+    else {
+        return ExplicitDestination::None;
+    };
+    let depth_from_music = path.len() - 1 - music_index;
+    let storage_id = path.last().expect("path is non-empty").storage_id;
+    match depth_from_music {
+        1 => ExplicitDestination::Artist {
+            artist_folder_id: folder_id,
+            storage_id,
+        },
+        2 => ExplicitDestination::Album {
+            folder_id,
+            storage_id,
+        },
+        _ => ExplicitDestination::None,
+    }
+}
+
+fn folder_path(folders: &[Folder], target: u32) -> Option<Vec<&Folder>> {
+    for folder in folders {
+        if folder.id == target {
+            return Some(vec![folder]);
+        }
+        if let Some(mut path) = folder_path(&folder.children, target) {
+            path.insert(0, folder);
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn find_folder_mut(folders: &mut [Folder], target: u32) -> Option<&mut Folder> {
+    for folder in folders {
+        if folder.id == target {
+            return Some(folder);
+        }
+        if let Some(found) = find_folder_mut(&mut folder.children, target) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn find_folder_ref(folders: &[Folder], target: u32) -> Option<&Folder> {
+    folders.iter().find_map(|folder| {
+        if folder.id == target {
+            Some(folder)
+        } else {
+            find_folder_ref(&folder.children, target)
+        }
+    })
+}
+
+/// Appends every descendant folder id in post-order (children before their
+/// own parent), so deleting the ids in order always empties a subfolder
+/// before the folder that contains it.
+fn collect_descendant_ids_post_order(folder: &Folder, out: &mut Vec<u32>) {
+    for child in &folder.children {
+        collect_descendant_ids_post_order(child, out);
+        out.push(child.id);
+    }
+}
+
+fn local_album_folder_name(source: &Path) -> String {
+    source
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Unknown Album".to_owned())
+}
+
+/// True when `folder_id` is an artist-level folder (Music/Artist) — the same
+/// classification `resolve_upload_destination` uses to decide whether an
+/// upload's destination is explicit. Exposed so the UI can warn before
+/// placing an album under an artist folder whose name doesn't match the
+/// files being uploaded.
+pub fn is_artist_folder(folders: &[Folder], folder_id: u32) -> bool {
+    matches!(
+        explicit_destination(folders, folder_id),
+        ExplicitDestination::Artist { .. }
+    )
+}
+
+/// Case-insensitive, "The "-agnostic artist name comparison — the same
+/// notion of "same artist" used when matching/creating folders on the
+/// device.
+pub fn same_artist_name(a: &str, b: &str) -> bool {
+    normalized_folder_name(a) == normalized_folder_name(b)
+}
+
+/// Best-effort guess at a local file's artist, for warning the user before
+/// an upload — not used for the actual upload's metadata (see
+/// `UploadTrackMetadata::read`), so a failure to read tags is just `None`
+/// rather than an error.
+pub fn detect_artist(source: &Path) -> Option<String> {
+    let tag_artist = lofty::read_from_path(source).ok().and_then(|tagged| {
+        tagged
+            .primary_tag()
+            .or_else(|| tagged.first_tag())
+            .and_then(Accessor::artist)
+            .map(|value| value.into_owned())
+            .filter(|value| !value.trim().is_empty())
+    });
+    tag_artist.or_else(|| folder_artist_album(source).0)
 }
 
 fn normalized_folder_name(name: &str) -> String {
@@ -1142,5 +1441,150 @@ mod tests {
         assert!(duplicate_track_exists(&tracks, 10, "Song"));
         assert!(!duplicate_track_exists(&tracks, 11, "Song"));
         assert!(!duplicate_track_exists(&tracks, 10, "song"));
+    }
+
+    fn music_tree() -> Vec<Folder> {
+        vec![Folder {
+            id: 1,
+            storage_id: 9,
+            name: "Music".to_owned(),
+            children: vec![Folder {
+                id: 2,
+                storage_id: 9,
+                name: "Neil Diamond".to_owned(),
+                children: vec![Folder {
+                    id: 3,
+                    storage_id: 9,
+                    name: "Hot August Night".to_owned(),
+                    children: Vec::new(),
+                }],
+            }],
+        }]
+    }
+
+    #[test]
+    fn explicit_destination_recognizes_artist_and_album_folders_under_music() {
+        let folders = music_tree();
+        assert!(matches!(
+            explicit_destination(&folders, 2),
+            ExplicitDestination::Artist {
+                artist_folder_id: 2,
+                storage_id: 9
+            }
+        ));
+        assert!(matches!(
+            explicit_destination(&folders, 3),
+            ExplicitDestination::Album {
+                folder_id: 3,
+                storage_id: 9
+            }
+        ));
+    }
+
+    #[test]
+    fn explicit_destination_ignores_music_itself_and_unrelated_folders() {
+        let folders = music_tree();
+        assert!(matches!(
+            explicit_destination(&folders, 1),
+            ExplicitDestination::None
+        ));
+        assert!(matches!(
+            explicit_destination(&folders, 42),
+            ExplicitDestination::None
+        ));
+    }
+
+    #[test]
+    fn find_folder_mut_locates_nested_folder() {
+        let mut folders = music_tree();
+        let found = find_folder_mut(&mut folders, 3).expect("album folder exists");
+        assert_eq!(found.name, "Hot August Night");
+        found.children.push(Folder {
+            id: 4,
+            storage_id: 9,
+            name: "extra".to_owned(),
+            children: Vec::new(),
+        });
+        assert_eq!(folders[0].children[0].children[0].children.len(), 1);
+    }
+
+    #[test]
+    fn local_album_folder_name_uses_parent_directory() {
+        assert_eq!(
+            local_album_folder_name(Path::new("/music/Neil Diamond/Hot August Night/song.mp3")),
+            "Hot August Night"
+        );
+        assert_eq!(
+            local_album_folder_name(Path::new("song.mp3")),
+            "Unknown Album"
+        );
+    }
+
+    #[test]
+    fn is_artist_folder_matches_only_artist_level() {
+        let folders = music_tree();
+        assert!(is_artist_folder(&folders, 2));
+        assert!(!is_artist_folder(&folders, 3));
+        assert!(!is_artist_folder(&folders, 1));
+    }
+
+    #[test]
+    fn same_artist_name_folds_case_and_leading_the() {
+        assert!(same_artist_name("The Beatles", "beatles"));
+        assert!(same_artist_name("Neil Diamond", "Neil Diamond"));
+        assert!(!same_artist_name("Neil Diamond", "Neil Young"));
+    }
+
+    #[test]
+    fn detect_artist_falls_back_to_letter_bucket_folder_when_file_is_unreadable() {
+        // The path doesn't need to exist on disk: the tag read fails and
+        // detect_artist falls back to the letter-bucket folder heuristic.
+        assert_eq!(
+            detect_artist(Path::new("/music/A/All Them Witches/ATW/Fishbelley.mp3")).as_deref(),
+            Some("All Them Witches")
+        );
+        assert_eq!(detect_artist(Path::new("/music/_assets/loose.mp3")), None);
+    }
+
+    #[test]
+    fn find_folder_ref_locates_nested_folder_immutably() {
+        let folders = music_tree();
+        assert_eq!(
+            find_folder_ref(&folders, 3).unwrap().name,
+            "Hot August Night"
+        );
+        assert!(find_folder_ref(&folders, 999).is_none());
+    }
+
+    #[test]
+    fn descendant_ids_are_collected_children_before_parent() {
+        let folders = vec![Folder {
+            id: 1,
+            storage_id: 9,
+            name: "Music".to_owned(),
+            children: vec![Folder {
+                id: 2,
+                storage_id: 9,
+                name: "Artist".to_owned(),
+                children: vec![
+                    Folder {
+                        id: 3,
+                        storage_id: 9,
+                        name: "Album A".to_owned(),
+                        children: Vec::new(),
+                    },
+                    Folder {
+                        id: 4,
+                        storage_id: 9,
+                        name: "Album B".to_owned(),
+                        children: Vec::new(),
+                    },
+                ],
+            }],
+        }];
+        let artist = find_folder_ref(&folders, 2).unwrap();
+        let mut out = Vec::new();
+        collect_descendant_ids_post_order(artist, &mut out);
+        assert_eq!(out, vec![3, 4]);
     }
 }
