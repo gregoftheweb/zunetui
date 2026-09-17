@@ -1109,7 +1109,10 @@ impl App {
                     self.transfer_status = Some(if failures.is_empty() {
                         format!("{verb} {completed} item(s) successfully.")
                     } else {
-                        format!("{verb} {completed}; failures: {}", failures.join(" | "))
+                        format!(
+                            "{verb} {completed}; failures: {}",
+                            summarize_failures(&failures)
+                        )
                     });
                 }
             }
@@ -1310,6 +1313,24 @@ fn spawn_transfer(job: TransferJob) -> Receiver<TransferEvent> {
         });
     });
     receiver
+}
+
+/// Caps how many failure lines land in the status bar. A batch transfer
+/// (e.g. an album that's entirely the wrong audio format) can fail every
+/// item with the *same* reason — showing all of them turns the status line
+/// into an unreadable wall of repeated text, so only the first few are
+/// shown with a count of the rest.
+fn summarize_failures(failures: &[String]) -> String {
+    const MAX_SHOWN: usize = 3;
+    if failures.len() <= MAX_SHOWN {
+        failures.join(" | ")
+    } else {
+        format!(
+            "{} | ...and {} more",
+            failures[..MAX_SHOWN].join(" | "),
+            failures.len() - MAX_SHOWN
+        )
+    }
 }
 
 fn safe_download_name(track: &Track) -> String {
@@ -2653,6 +2674,26 @@ mod tests {
         // A full period (there and back) returns to the start.
         let period = 2 * (SPINNER_WIDTH - 1);
         assert_eq!(spinner_line(3 * period), spinner_line(0));
+    }
+
+    #[test]
+    fn summarize_failures_passes_short_lists_through_unchanged() {
+        let failures = vec!["a: oops".to_owned(), "b: oops".to_owned()];
+        assert_eq!(summarize_failures(&failures), "a: oops | b: oops");
+    }
+
+    #[test]
+    fn summarize_failures_caps_a_long_list_with_a_remaining_count() {
+        let failures: Vec<String> = (0..18)
+            .map(|index| format!("track {index}: the Zune doesn't support .flac audio"))
+            .collect();
+        assert_eq!(
+            summarize_failures(&failures),
+            "track 0: the Zune doesn't support .flac audio | \
+             track 1: the Zune doesn't support .flac audio | \
+             track 2: the Zune doesn't support .flac audio | \
+             ...and 15 more"
+        );
     }
 
     #[test]

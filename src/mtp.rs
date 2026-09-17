@@ -457,6 +457,9 @@ impl Device {
         if !metadata.is_file() {
             return Err("source is not a regular file".to_owned());
         }
+        if let Some(reason) = unsupported_format_reason(source) {
+            return Err(reason);
+        }
         let path = path_cstring(source)?;
         let filename = source
             .file_name()
@@ -1320,6 +1323,25 @@ fn os_cstring(value: &std::ffi::OsStr) -> Result<CString, String> {
     CString::new(value.as_bytes()).map_err(|_| "path contains a NUL byte".to_owned())
 }
 
+/// Stock Zune firmware has never supported FLAC or Ogg Vorbis — only WMA,
+/// MP3, AAC (`.m4a`), and WAV. Uploading either format still reaches the
+/// device and is rejected outright at the protocol level ("PTP Invalid
+/// Code Format", before any data transfers), so it's worth failing fast
+/// with a clear reason instead of that cryptic PTP error code.
+fn unsupported_format_reason(source: &Path) -> Option<String> {
+    let extension = source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "flac" | "ogg" => Some(format!(
+            "the Zune doesn't support .{extension} audio — convert to MP3, WMA, AAC (.m4a), or WAV first"
+        )),
+        _ => None,
+    }
+}
+
 fn filetype_for(path: &Path) -> raw::LIBMTP_filetype_t {
     match path
         .extension()
@@ -1544,6 +1566,28 @@ mod tests {
             Some("All Them Witches")
         );
         assert_eq!(detect_artist(Path::new("/music/_assets/loose.mp3")), None);
+    }
+
+    #[test]
+    fn unsupported_format_reason_flags_flac_and_ogg_but_not_native_formats() {
+        assert!(
+            unsupported_format_reason(Path::new("song.flac"))
+                .unwrap()
+                .contains(".flac")
+        );
+        assert!(
+            unsupported_format_reason(Path::new("song.ogg"))
+                .unwrap()
+                .contains(".ogg")
+        );
+        for extension in ["mp3", "wma", "wav", "m4a", "MP3", "Flac"] {
+            let owned_path = format!("song.{extension}");
+            assert_eq!(
+                unsupported_format_reason(Path::new(&owned_path)).is_some(),
+                extension.eq_ignore_ascii_case("flac"),
+                "unexpected classification for .{extension}"
+            );
+        }
     }
 
     #[test]
